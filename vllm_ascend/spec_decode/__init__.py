@@ -19,7 +19,7 @@
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
 from vllm_ascend.spec_decode.mtp_proposer import MtpProposer
 from vllm_ascend.spec_decode.ngram_proposer import NgramProposer
-
+from vllm_ascend.spec_decode.draft_model import DraftModelProposer
 
 def get_spec_decode_method(method, vllm_config, device, runner):
     if method == "ngram":
@@ -28,6 +28,8 @@ def get_spec_decode_method(method, vllm_config, device, runner):
         return EagleProposer(vllm_config, device, runner)
     elif method == 'deepseek_mtp':
         return MtpProposer(vllm_config, device, runner)
+    elif method == 'draft_model':
+        return DraftModelProposer(vllm_config, device, runner)
     else:
         raise ValueError("Unknown speculative decoding method: "
                          f"{method}")
