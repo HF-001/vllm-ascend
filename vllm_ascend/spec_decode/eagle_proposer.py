@@ -40,6 +40,12 @@ class EagleProposer(Proposer):
                  vllm_config: VllmConfig,
                  device: torch.device,
                  runner=None):
+        
+        if vllm_config.speculative_config is None:
+            raise ValueError(
+                "EagleProposer requires speculative_config to be set. "
+                "This indicates a configuration error in vLLM initialization."
+            )
         self.name = SpecDcodeType.EAGLE if vllm_config.speculative_config.method == "eagle" else SpecDcodeType.EAGLE3
         self.vllm_config = vllm_config
         self.device = device
@@ -93,6 +99,20 @@ class EagleProposer(Proposer):
         attn_mask_len = self.vllm_config.model_config.max_model_len
         self.attn_mask_builder = AttentionMaskBuilder(
             attn_mask_len, self.vllm_config.model_config.dtype)
+        # Get pad_token_id from draft model config for masking stopped sequences
+        self.draft_model_config = self.vllm_config.speculative_config.draft_model_config
+        self.pad_token_id = (
+            self.draft_model_config.hf_config.pad_token_id
+            if hasattr(self.draft_model_config.hf_config, "pad_token_id")
+            and self.draft_model_config.hf_config.pad_token_id is not None
+            else 0
+        )
+        self.confidence_threshold = self.vllm_config.speculative_config.draft_confidence_threshold
+        # Continue mask for confidence-based early stopping
+        self.continue_mask = torch.ones(
+            self.max_num_tokens, dtype=torch.bool, device=device
+        )
+
 
     def load_model(self, model: nn.Module) -> None:
         target_attn_layer_names = set(
@@ -417,6 +437,7 @@ class EagleProposer(Proposer):
         # [batch_size, max_num_blocks_per_req]
         block_table: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        draft_length: int | None = None,
     ) -> torch.Tensor:
         device = cu_num_tokens.device
         cu_num_tokens = cu_num_tokens.cpu()
@@ -425,6 +446,20 @@ class EagleProposer(Proposer):
         batch_size = next_token_ids.shape[0]
         last_token_indices = cu_num_tokens[1:] - 1
         target_positions = target_positions.cpu()
+
+        # Use provided draft_length or fall back to default
+        if draft_length is None:
+            draft_length = self.vllm_config.speculative_config.num_speculative_tokens
+        elif draft_length < 1:
+            # Minimum draft length is 1
+            draft_length = 1
+        elif draft_length > self.vllm_config.speculative_config.num_speculative_tokens:
+            # Cap at max configured length
+            draft_length = self.vllm_config.speculative_config.num_speculative_tokens
+
+        # After normalization, draft_length is guaranteed to be an int
+        assert draft_length is not None
+
         if self.name == SpecDcodeType.EAGLE3:
             assert isinstance(self.model, Eagle3LlamaForCausalLM)
             target_hidden_states = self.model.combine_hidden_states(
@@ -497,7 +532,7 @@ class EagleProposer(Proposer):
         draft_token_ids = logits.argmax(dim=-1)
 
         # Early exit if there is only one draft token to be generated.
-        if self.vllm_config.speculative_config.num_speculative_tokens == 1:
+        if draft_length == 1:
             # [batch_size, 1]
             return draft_token_ids.view(-1, 1)
 
@@ -527,13 +562,18 @@ class EagleProposer(Proposer):
         attn_metadata.query_lens = query_lens
 
         attn_metadata.attn_state = AscendAttentionState.ChunkedPrefill
-        for now_speculative in range(
-                self.vllm_config.speculative_config.num_speculative_tokens -
-                1):
+        # Initialize continue mask for confidence-based early stopping
+        self.continue_mask[:batch_size] = True
+        for now_speculative in range(draft_length - 1):
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
+            active_mask = self.continue_mask[:batch_size]
             input_ids = draft_token_ids_tensor[now_speculative].to(device)
+            if now_speculative > 0:
+                input_ids = torch.where(
+                    self.continue_mask[:batch_size], input_ids, self.pad_token_id
+                )
             positions_cpu += 1
 
             # NOTE(woosuk): We should handle the case where the draft model
@@ -551,7 +591,11 @@ class EagleProposer(Proposer):
 
             # TODO: Increment the sequence lengths.
 
-            attn_metadata.seq_lens += 1
+            # attn_metadata.seq_lens += 1
+            length_increments = active_mask.to(attn_metadata.seq_lens.dtype)
+            attn_metadata.seq_lens += length_increments
+            # common_attn_metadata.seq_lens_cpu += active_mask.cpu().to(
+            #     common_attn_metadata.seq_lens_cpu.dtype
             # TODO: Consider max model length.
             # attn_metadata.max_seq_len = min(attn_metadata.max_seq_len,
             #                                 self.max_model_len)
@@ -572,6 +616,11 @@ class EagleProposer(Proposer):
             # padding tokens.
             slot_mapping_cpu.masked_fill_(exceeds_max_model_len,
                                           PADDING_SLOT_ID)
+            # Gate K/V writes for stopped sequences (confidence-based early stopping)
+            if now_speculative > 0:
+                stopped_mask = ~self.continue_mask[:batch_size]
+                attn_metadata.slot_mapping[stopped_mask] = PADDING_SLOT_ID
+
             # NOTE: ASCEND slot_mapping must on cpu
             attn_metadata.slot_mapping = slot_mapping_cpu.to(
                 torch.int32).to(device)
@@ -602,6 +651,9 @@ class EagleProposer(Proposer):
             # TODO(wenlong): get more than one token for tree attention
             draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_tensor[now_speculative + 1] = draft_token_ids.cpu()
+            probs = logits.softmax(dim=-1, dtype=torch.float32)
+            confidence = probs.max(dim=-1).values
+            self.continue_mask[:batch_size] &= confidence >= self.confidence_threshold
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = draft_token_ids_tensor.swapaxes(0, 1)
