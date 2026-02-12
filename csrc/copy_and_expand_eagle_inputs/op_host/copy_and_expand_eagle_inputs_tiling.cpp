@@ -8,7 +8,6 @@
 #include "tiling/platform/platform_ascendc.h"
 
 #include <algorithm>
-#include <cstdio>
 
 namespace optiling {
 
@@ -79,4 +78,9 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 
     return ge::GRAPH_SUCCESS;
 }
+
+// Register tiling function with the CANN framework by operator name.
+// This replaces the old SetTiling() approach and avoids cross-SO symbol issues.
+IMPL_OP_OPTILING(CopyAndExpandEagleInputs).Tiling(TilingFunc);
+
 }  // namespace optiling

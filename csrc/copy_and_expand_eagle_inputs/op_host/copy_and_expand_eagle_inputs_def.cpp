@@ -1,30 +1,9 @@
 /**
  * @file copy_and_expand_eagle_inputs_def.cpp
- * @brief CopyAndExpandEagleInputs OpDef, InferShape, InferDataType
+ * @brief CopyAndExpandEagleInputs OpDef registration
  */
 
 #include "register/op_def_registry.h"
-
-namespace ge {
-
-static ge::graphStatus InferShape(gert::InferShapeContext* context)
-{
-    return GRAPH_SUCCESS;
-}
-
-static ge::graphStatus InferDataType(gert::InferDataTypeContext* context)
-{
-    return GRAPH_SUCCESS;
-}
-
-}  // namespace ge
-
-
-namespace optiling {
-// Forward declaration of TilingFunc (defined in tiling cpp)
-static ge::graphStatus TilingFunc(gert::TilingContext* context);
-}  // namespace optiling
-
 
 namespace ops {
 
@@ -98,12 +77,7 @@ public:
         this->Attr("shift_input_ids").Bool();
         this->Attr("total_input_tokens").Int();
 
-        // -------------------- InferShape / InferDataType --------------------
-        this->SetInferShape(ge::InferShape)
-            .SetInferDataType(ge::InferDataType);
-
-        // -------------------- Tiling --------------------
-        this->AICore().SetTiling(optiling::TilingFunc);
+        // -------------------- Platform --------------------
         this->AICore().AddConfig("ascend910b");
     }
 };
