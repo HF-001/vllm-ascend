@@ -104,15 +104,9 @@ static ge::graphStatus TilingPrepare4CopyAndExpandEagleInputs(gert::TilingParseC
     OPS_LOG_D(context, "TilingPrepare4CopyAndExpandEagleInputs running.");
     OPS_LOG_I(context, "TilingPrepare4CopyAndExpandEagleInputs running.");
     auto compileInfo = context->GetCompiledInfo<CopyAndExpandEagleInputsCompileInfo>();
-    if (compileInfo == nullptr) {
-        OPS_LOG_E(context, "compileInfo is nullptr!");
-        return ge::GRAPH_FAILED;
-    }
+    OP_CHECK_NULL_WITH_CONTEXT(context, compileInfo);
     auto platformInfo = context->GetPlatformInfo();
-    if (platformInfo == nullptr) {
-        OPS_LOG_E(context, "platformInfo is nullptr!");
-        return ge::GRAPH_FAILED;
-    }
+    OP_CHECK_NULL_WITH_CONTEXT(context, platformInfo);
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
 
     compileInfo->totalCoreNum = ascendcPlatform.GetCoreNum();
