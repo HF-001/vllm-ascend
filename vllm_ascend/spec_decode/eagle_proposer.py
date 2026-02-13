@@ -459,6 +459,7 @@ class SpecDecodeBaseProposer(VllmSpecDecodeBaseProposer):
         num_decode_reqs=0,
         scheduler_output: SchedulerOutput = None,
         num_scheduled_tokens: int = 0,
+        num_rejected_tokens_gpu: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size = common_attn_metadata.batch_size()
 
@@ -1205,7 +1206,9 @@ class SpecDecodeBaseProposer(VllmSpecDecodeBaseProposer):
             device = valid_sampled_tokens_count.device
 
             token_indices_to_sample = torch.empty((num_reqs,), dtype=torch.int32, device=device)
-
+            num_rejected_tokens_gpu = torch.empty(
+            (num_reqs,), dtype=torch.int32, device=device
+            )
             num_blocks_needed = triton.cdiv(num_reqs, _PREPARE_INPUTS_BLOCK_SIZE)
             num_vector_core = get_vectorcore_num()
             grid_size = min(num_blocks_needed, num_vector_core)
@@ -1216,6 +1219,7 @@ class SpecDecodeBaseProposer(VllmSpecDecodeBaseProposer):
                 valid_sampled_tokens_count,
                 common_attn_metadata.query_start_loc,
                 token_indices_to_sample,
+                num_rejected_tokens_gpu,
                 num_reqs,
                 BLOCK_SIZE=_PREPARE_INPUTS_BLOCK_SIZE,
             )
@@ -1264,7 +1268,7 @@ class SpecDecodeBaseProposer(VllmSpecDecodeBaseProposer):
             max_seq_len=0,
         )
 
-        return spec_common_attn_metadata, token_indices, token_indices_to_sample
+        return spec_common_attn_metadata, token_indices, token_indices_to_sample, num_rejected_tokens_gpu
 
     def _split_pcp_input(self, req_scheduled_tokens, input_ids, target_hidden_states):
         """
