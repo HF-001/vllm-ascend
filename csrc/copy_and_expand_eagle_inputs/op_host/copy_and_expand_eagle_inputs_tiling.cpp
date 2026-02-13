@@ -25,7 +25,7 @@ static void GetCompileParameters(
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
-    OP_LOGI("TilingFunc", "Enter TilingFunc for CopyAndExpandEagleInputs");
+    OPS_LOG_I(context, "Enter TilingFunc for CopyAndExpandEagleInputs");
     OPS_LOG_D(context, "TilingFunc running.");
 
     // ========== 1. Get hardware core count ==========
@@ -102,7 +102,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
 static ge::graphStatus TilingPrepare4CopyAndExpandEagleInputs(gert::TilingParseContext* context)
 {
     OPS_LOG_D(context, "TilingPrepare4CopyAndExpandEagleInputs running.");
-    OP_LOGI(context, "TilingPrepare4CopyAndExpandEagleInputs running.");
+    OPS_LOG_I(context, "TilingPrepare4CopyAndExpandEagleInputs running.");
     auto compileInfo = context->GetCompiledInfo<CopyAndExpandEagleInputsCompileInfo>();
     OP_CHECK_NULL_WITH_CONTEXT(context, compileInfo);
     auto platformInfo = context->GetPlatformInfo();

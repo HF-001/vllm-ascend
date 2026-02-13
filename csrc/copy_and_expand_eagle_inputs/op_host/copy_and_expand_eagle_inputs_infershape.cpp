@@ -3,7 +3,20 @@
  * @brief InferShape and InferDataType for CopyAndExpandEagleInputs
  */
 
-#include "register/op_impl_registry.h"
+#include "register/op_def_registry.h"
+#include "log/ops_log.h"
+
+#define unlikely(x) __builtin_expect((x), 0)
+#define OP_CHECK_NULL_WITH_CONTEXT(context, ptr)                                                           \
+    do {                                                                                                   \
+        if (unlikely((ptr) == nullptr)) {                                                                  \
+            const char* name = (unlikely(((context) == nullptr) || (context)->GetNodeName() == nullptr)) ? \
+                                   "nil" :                                                                 \
+                                   (context)->GetNodeName();                                               \
+            OPS_LOG_E(name, "%s is nullptr!", #ptr);                                                       \
+            return ge::GRAPH_FAILED;                                                                       \
+        }                                                                                                  \
+    } while (0)
 
 static constexpr int IDX_TARGET_TOKEN_IDS = 0;
 static constexpr int IDX_TARGET_POSITIONS = 1;
