@@ -503,8 +503,8 @@ class SpecDecodeBaseProposer(VllmSpecDecodeBaseProposer):
             batch_descriptor = None
 
         # copy inputs to buffer for cudagraph
-        self._set_positions(num_tokens, target_positions)
-        self.hidden_states[:num_tokens] = target_hidden_states
+        # self._set_positions(num_tokens, target_positions)
+        # self.hidden_states[:num_tokens] = target_hidden_states
 
         if self.supports_mm_inputs:
             mm_embeds, is_mm_embed = mm_embed_inputs or (None, None)
