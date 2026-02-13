@@ -5,17 +5,32 @@
 
 #include "copy_and_expand_eagle_inputs_tiling.h"
 #include "register/op_def_registry.h"
-#include "tiling/platform/platform_ascendc.h"
+#include "log/ops_log.h"
 
 #include <algorithm>
 
 namespace optiling {
 
+static void GetCompileParameters(
+    gert::TilingContext* context, uint32_t& coreNum)
+{
+    auto ptrCompileInfo = reinterpret_cast<const CopyAndExpandEagleInputsCompileInfo*>(context->GetCompileInfo());
+    if (ptrCompileInfo == nullptr) {
+        auto ascendcPlatform = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
+        coreNum = ascendcPlatform.GetCoreNum();
+    } else {
+        coreNum = ptrCompileInfo->totalCoreNum;
+    }
+}
+
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
+    OP_LOGI("TilingFunc", "Enter TilingFunc for CopyAndExpandEagleInputs");
+    OPS_LOG_D(context, "TilingFunc running.");
+
     // ========== 1. Get hardware core count ==========
-    auto platformInfo = platform_ascendc::PlatformAscendC(context->GetPlatformInfo());
-    uint32_t coreNum = platformInfo.GetCoreNum();
+    uint32_t coreNum;
+    GetCompileParameters(context, coreNum);
 
     // ========== 2. Derive num_reqs from query_start_loc shape ==========
     // query_start_loc is the 4th input (index 3), shape [num_reqs + 1]
@@ -76,11 +91,31 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     // ========== 8. Set block_dim ==========
     context->SetBlockDim(usedCoreNum);
 
+    OPS_LOG_I(context, "Block Dim: %u", usedCoreNum);
+    OPS_LOG_I(context,
+        "numReqs: %u, reqsPerCore: %u, remainderReqs: %u, totalInputTokens: %d, totalDraftTokens: %u",
+        numReqs, reqsPerCore, remainderReqs, totalInputTokens, totalDraftTokens);
+
     return ge::GRAPH_SUCCESS;
 }
 
-// Register tiling function with the CANN framework by operator name.
-// This replaces the old SetTiling() approach and avoids cross-SO symbol issues.
-IMPL_OP_OPTILING(CopyAndExpandEagleInputs).Tiling(TilingFunc);
+static ge::graphStatus TilingPrepare4CopyAndExpandEagleInputs(gert::TilingParseContext* context)
+{
+    OPS_LOG_D(context, "TilingPrepare4CopyAndExpandEagleInputs running.");
+    OP_LOGI(context, "TilingPrepare4CopyAndExpandEagleInputs running.");
+    auto compileInfo = context->GetCompiledInfo<CopyAndExpandEagleInputsCompileInfo>();
+    OP_CHECK_NULL_WITH_CONTEXT(context, compileInfo);
+    auto platformInfo = context->GetPlatformInfo();
+    OP_CHECK_NULL_WITH_CONTEXT(context, platformInfo);
+    auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
+
+    compileInfo->totalCoreNum = ascendcPlatform.GetCoreNum();
+
+    return ge::GRAPH_SUCCESS;
+}
+
+IMPL_OP_OPTILING(CopyAndExpandEagleInputs)
+    .Tiling(TilingFunc)
+    .TilingParse<CopyAndExpandEagleInputsCompileInfo>(TilingPrepare4CopyAndExpandEagleInputs);
 
 }  // namespace optiling

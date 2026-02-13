@@ -17,4 +17,6 @@ target_include_directories(optiling PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-target_sources(opsproto PRIVATE)
+target_sources(opsproto PRIVATE
+        copy_and_expand_eagle_inputs_infershape.cpp
+)

@@ -2,6 +2,8 @@
 #define COPY_AND_EXPAND_EAGLE_INPUTS_TILING_H
 
 #include "register/tilingdata_base.h"
+#include "register/op_impl_registry.h"
+#include "tiling/platform/platform_ascendc.h"
 
 namespace optiling {
 
@@ -22,6 +24,10 @@ BEGIN_TILING_DATA_DEF(CopyAndExpandEagleInputsTilingData)
     // ---- 输出尺寸 ----
     TILING_DATA_FIELD_DEF(uint32_t, totalDraftTokens);       // 输出 token 总数
 END_TILING_DATA_DEF;
+
+struct CopyAndExpandEagleInputsCompileInfo {
+    uint32_t totalCoreNum = 0;
+};
 
 REGISTER_TILING_DATA_CLASS(CopyAndExpandEagleInputs, CopyAndExpandEagleInputsTilingData)
 
