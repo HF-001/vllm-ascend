@@ -840,7 +840,7 @@ class SpecDecodeBaseProposer(VllmSpecDecodeBaseProposer):
                 out_hidden_state_mapping,
             ) = torch.ops._C_ascend.npu_copy_and_expand_eagle_inputs(
                 target_token_ids,
-                target_positions,
+                target_positions.to(torch.int32),
                 next_token_ids,
                 query_start_loc,
                 query_end_loc,
