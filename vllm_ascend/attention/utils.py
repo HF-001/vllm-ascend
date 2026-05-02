@@ -194,6 +194,15 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             query_start_loc_cpu=self.query_start_loc_cpu[: num_actual_reqs + 1],
             seq_lens=self.seq_lens[:num_actual_reqs],
             seq_lens_cpu=self.seq_lens_cpu[:num_actual_reqs] if self.seq_lens_cpu is not None else None,
+            # Propagate the host-side seq_lens views so downstream spec
+            # decode passes (eagle, dflash) keep the no-sync upper-bound
+            # path established in the parent metadata.
+            _seq_lens_cpu=self._seq_lens_cpu[:num_actual_reqs]
+            if self._seq_lens_cpu is not None
+            else None,
+            seq_lens_cpu_upper_bound=self.seq_lens_cpu_upper_bound[:num_actual_reqs]
+            if self.seq_lens_cpu_upper_bound is not None
+            else None,
             num_computed_tokens_cpu=self.num_computed_tokens_cpu[:num_actual_reqs]
             if self.num_computed_tokens_cpu is not None
             else None,

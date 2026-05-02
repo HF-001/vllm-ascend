@@ -2381,19 +2381,36 @@ class NPUModelRunner(GPUModelRunner):
         if ubatch_slices is not None:
             attn_metadata = [dict() for _ in range(len(ubatch_slices))]
 
-        # Ensure the async GPU→CPU copy of corrected seq_lens (launched in
-        # _prepare_inputs) has completed before we read optimistic_seq_lens_cpu.
-        if self._seq_lens_cpu_event_pending and self._seq_lens_cpu_event is not None:
-            self._seq_lens_cpu_event.synchronize()
-            self._seq_lens_cpu_event_pending = False
-
+        # max_seq_len only needs an *upper bound* (sizing decision for
+        # kernel/cudagraph dispatch). Compute it from the optimistic CPU
+        # snapshot established at the start of _prepare_inputs, which is
+        # already an upper bound on the real per-row seq_len:
+        #   - non-async paths: exact (== seq_lens)
+        #   - async-spec paths: optimistic (assumes all drafts accepted),
+        #     which is by definition >= the corrected exact value.
+        # Reading this BEFORE the D2H event sync below avoids stalling
+        # the host on the GPU->CPU copy for a value that doesn't need
+        # exactness, mirroring the upstream optimization in vllm
+        # PR #40654 (seq_lens_cpu_upper_bound).
         if for_cudagraph_capture:
             # For some attention backends (e.g. FA) with sliding window models we need
             # to make sure the backend see a max_seq_len that is larger to the sliding
             # window size when capturing to make sure the correct kernel is selected.
             max_seq_len = self.max_model_len
         else:
-            max_seq_len = self.optimistic_seq_lens_cpu.numpy()[:num_reqs].max().item()
+            max_seq_len = int(
+                self.optimistic_seq_lens_cpu.numpy()[:num_reqs].max()
+            )
+
+        # Ensure the async GPU→CPU copy of corrected seq_lens (launched in
+        # _prepare_inputs, only in async-spec-decode mode) has completed
+        # before we expose ``_seq_lens_cpu`` to NPU attention backends
+        # (AscendAttentionBackend, AscendMLABackend) — they consume it as
+        # *kernel input* and need exact per-row context lengths, unlike
+        # the upstream upper-bound-only consumers.
+        if self._seq_lens_cpu_event_pending and self._seq_lens_cpu_event is not None:
+            self._seq_lens_cpu_event.synchronize()
+            self._seq_lens_cpu_event_pending = False
 
 
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
@@ -2477,6 +2494,15 @@ class NPUModelRunner(GPUModelRunner):
             # This is separate from seq_lens_cpu (None in async) which eagle
             # proposer checks to distinguish async/non-async behavior.
             _seq_lens_cpu=self.optimistic_seq_lens_cpu[:num_reqs_padded],
+            # CPU upper bound on seq_lens, always populated regardless of
+            # async-spec mode. Mirrors the field added by upstream vllm
+            # PR #40654: callers that only need a host-visible upper
+            # bound (e.g. for kernel/cudagraph sizing) can read this
+            # without paying the GPU->CPU sync cost. Equal to
+            # ``num_computed_tokens_cpu + num_scheduled_tokens`` which is
+            # exact in non-async paths and an optimistic upper bound in
+            # async-spec paths (assumes all drafts accepted).
+            seq_lens_cpu_upper_bound=self.optimistic_seq_lens_cpu[:num_reqs_padded],
             # TODO
             seq_lens_cpu=seq_lens_cpu,
             # TODO
