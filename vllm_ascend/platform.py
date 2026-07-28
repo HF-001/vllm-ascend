@@ -240,6 +240,53 @@ class NPUPlatform(Platform):
         return min(max_num_seqs * decode_query_len, 512)
 
     @classmethod
+    def _maybe_expand_token_budget_for_dflash(cls, vllm_config: VllmConfig) -> None:
+        """Ensure ``max_num_batched_tokens`` covers the DFlash draft query block.
+
+        DFlash cross-attention expands every request into a ``(1 + K)`` query
+        block (bonus + ``K`` mask tokens), so a full decode batch feeds the
+        torch-compiled draft model up to ``max_num_seqs * (1 + K)`` tokens in a
+        single forward. Compile ranges, cudagraph sizes and the draft's per-query
+        buffers are all bounded by ``max_num_batched_tokens``; if the expanded
+        query exceeds it, the draft forward falls outside the compiled shape
+        ranges and aborts with e.g. ``Shape: 2304 out of considered ranges:
+        [(1, 2048)]``. Raise the budget so the whole draft path shares one
+        consistent bound. Only DFlash expands the query like this (eagle/mtp
+        draft one token per step; DSpark runs eager and is not torch-compiled).
+        """
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config is None or getattr(speculative_config, "method", None) != "dflash":
+            return
+        num_spec = speculative_config.num_speculative_tokens
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        if not num_spec or scheduler_config is None:
+            return
+        max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
+        current = getattr(scheduler_config, "max_num_batched_tokens", None)
+        if max_num_seqs is None or current is None:
+            return
+        # DFlash query block per request is ``1 + num_speculative_tokens``.
+        max_query_tokens = max_num_seqs * (1 + num_spec)
+        if current >= max_query_tokens:
+            return
+        logger.warning(
+            "DFlash drafts a %d-token query block per request, so a full decode "
+            "batch (max_num_seqs=%d) feeds the draft model up to %d tokens per "
+            "forward, exceeding max_num_batched_tokens=%d. Raising "
+            "max_num_batched_tokens to %d to keep the draft within the compiled "
+            "shape ranges. To control this explicitly, set "
+            "--max-num-batched-tokens >= %d, or lower --max-num-seqs / "
+            "num_speculative_tokens.",
+            1 + num_spec,
+            max_num_seqs,
+            max_query_tokens,
+            current,
+            max_query_tokens,
+            max_query_tokens,
+        )
+        scheduler_config.max_num_batched_tokens = max_query_tokens
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0):
         return None
 
@@ -454,6 +501,11 @@ class NPUPlatform(Platform):
                 if not isinstance(ascend_compilation_config, dict)
                 else ascend_compilation_config
             )
+
+        # Must run before ``_set_cudagraph_sizes`` (below) and vLLM's
+        # ``_set_compile_ranges`` (VllmConfig.__post_init__, after this call), as
+        # both derive their upper bound from ``max_num_batched_tokens``.
+        cls._maybe_expand_token_budget_for_dflash(vllm_config)
 
         ascend_config.update_compile_ranges_split_points()
 
