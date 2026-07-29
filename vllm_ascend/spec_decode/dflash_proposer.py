@@ -28,15 +28,6 @@ class AscendDflashProposer(AscendEagleProposer):
         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
         self.max_positions = self.max_num_tokens + self.max_query_tokens
 
-        # The DFlash draft processes up to ``num_query_total = num_reqs * (1+K)``
-        # query tokens, whose upper bound is ``max_query_tokens = max_num_seqs *
-        # (1+K)``. ``NPUPlatform._validate_token_budget_for_dflash`` enforces
-        # ``max_num_batched_tokens >= max_query_tokens`` at startup, so
-        # ``max_num_tokens >= max_query_tokens`` here and every per-query buffer
-        # is large enough at its natural size (the inherited ``self.input_ids``
-        # sized ``max_num_tokens`` included). ``num_input_tokens`` is likewise
-        # clamped to ``max_query_tokens`` in ``dummy_run``, so slicing never
-        # exceeds these lengths.
         self._context_slot_mapping_buffers = torch.zeros(
             self.max_num_tokens,
             dtype=torch.int32,
