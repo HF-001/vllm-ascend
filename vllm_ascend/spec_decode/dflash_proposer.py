@@ -29,32 +29,14 @@ class AscendDflashProposer(AscendEagleProposer):
         self.max_positions = self.max_num_tokens + self.max_query_tokens
 
         # The DFlash draft processes up to ``num_query_total = num_reqs * (1+K)``
-        # query tokens, whose upper bound is
-        # ``max_query_tokens = max_num_seqs * (1+K)``. Every per-query buffer must
-        # therefore be at least ``max_query_tokens`` long. This is NOT the same as
-        # the inherited ``max_num_tokens`` (= ``max_num_batched_tokens``): with a
-        # large ``num_speculative_tokens`` (e.g. K=8) ``max_query_tokens`` can
-        # exceed ``max_num_tokens``. Any per-query buffer sized only
-        # ``max_num_tokens`` then either (a) gets an out-of-bounds write from the
-        # input-expansion triton kernel, or (b) silently truncates when sliced
-        # ``[:num_query_total]``, leaving ``positions`` and the query tensor with
-        # different lengths and tripping RoPE's ``positions.shape[0] == num_tokens``
-        # assertion (seen in both the decode and the profile-run forward).
-        # Size every per-query buffer to cover both the query data and any padded
-        # graph size.
-        query_buffer_len = max(self.max_query_tokens, self.max_num_tokens)
-
-        # ``self.input_ids`` is allocated by the vLLM base proposer at
-        # ``max_num_tokens`` (dtype int32); the input-id kernel writes
-        # ``num_query_total`` entries into it and the profile forward slices
-        # ``[:num_query_total]``, so it must be re-sized to ``query_buffer_len``
-        # alongside the others.
-        self.input_ids = torch.zeros(
-            query_buffer_len,
-            dtype=torch.int32,
-            device=device,
-        )
-
+        # query tokens, whose upper bound is ``max_query_tokens = max_num_seqs *
+        # (1+K)``. ``NPUPlatform._validate_token_budget_for_dflash`` enforces
+        # ``max_num_batched_tokens >= max_query_tokens`` at startup, so
+        # ``max_num_tokens >= max_query_tokens`` here and every per-query buffer
+        # is large enough at its natural size (the inherited ``self.input_ids``
+        # sized ``max_num_tokens`` included). ``num_input_tokens`` is likewise
+        # clamped to ``max_query_tokens`` in ``dummy_run``, so slicing never
+        # exceeds these lengths.
         self._context_slot_mapping_buffers = torch.zeros(
             self.max_num_tokens,
             dtype=torch.int32,
@@ -62,7 +44,7 @@ class AscendDflashProposer(AscendEagleProposer):
         )
 
         self._slot_mapping_buffer = torch.zeros(
-            query_buffer_len,
+            self.max_query_tokens,
             dtype=torch.int32,
             device=device,
         )
@@ -74,7 +56,7 @@ class AscendDflashProposer(AscendEagleProposer):
         )
 
         self.positions = torch.zeros(
-            query_buffer_len,
+            self.max_query_tokens,
             dtype=torch.int32,
             device=device,
         )
