@@ -139,10 +139,9 @@ def test_cpu_offloading() -> None:
         kv_connector="OffloadingConnector",
         kv_role="kv_both",
         kv_connector_extra_config={
-            "num_cpu_blocks": 1000,
+            "cpu_bytes_to_use": 8 * (1 << 30),
             "block_size": 128,
-            "spec_name": "NPUOffloadingSpec",
-            "spec_module_path": "vllm_ascend.kv_offload.npu",
+            "spec_name": "CPUOffloadingSpec",
         },
     )
 

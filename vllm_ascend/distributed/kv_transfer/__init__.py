@@ -29,9 +29,7 @@ def register_connector():
     else:
         for name, class_name in (
             ("CPUOffloadingSpec", "NPUOffloadingSpec"),
-            ("NPUOffloadingSpec", "NPUOffloadingSpec"),
             ("TieringOffloadingSpec", "NPUTieringOffloadingSpec"),
-            ("NPUTieringOffloadingSpec", "NPUTieringOffloadingSpec"),
         ):
             OffloadingSpecFactory._registry.pop(name, None)
             OffloadingSpecFactory.register_spec(
@@ -40,7 +38,7 @@ def register_connector():
                 class_name,
             )
 
-    # Override the upstream filesystem secondary tier ("fs_python"). The
+    # Override the upstream filesystem secondary tier ("fs"). The
     # upstream tier opens block files with O_DIRECT, whose alignment
     # requirements the mmap-backed primary tier buffer does not generally
     # satisfy (notably on 3FS/FUSE, surfacing as EINVAL). The Ascend tier
@@ -50,9 +48,9 @@ def register_connector():
     except ImportError:
         pass
     else:
-        SecondaryTierFactory._registry.pop("fs_python", None)
+        SecondaryTierFactory._registry.pop("fs", None)
         SecondaryTierFactory.register_tier(
-            "fs_python",
+            "fs",
             "vllm_ascend.kv_offload.fs_tier",
             "AscendFileSystemTierManager",
         )

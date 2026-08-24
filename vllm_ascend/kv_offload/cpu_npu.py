@@ -12,13 +12,11 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
     GPULoadStoreSpec,
+    LoadStoreSpec,
+    OffloadingWorker,
+    TransferResult,
 )
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
-from vllm.v1.kv_offload.worker.worker import (
-    OffloadingHandler,
-    TransferResult,
-    TransferSpec,
-)
 
 DIRECTION_H2D = 0
 DIRECTION_D2H = 1
@@ -77,7 +75,7 @@ def compute_sub_block_ptrs(
     output[:] = flat[skip_count : skip_count + num_sub_blocks]
 
 
-class SingleDirectionNPUOffloadingHandler(OffloadingHandler):
+class SingleDirectionNPUOffloadingHandler:
     """Transfer KV blocks between NPU cache tensors and CPU offload tensors."""
 
     def __init__(
@@ -87,7 +85,6 @@ class SingleDirectionNPUOffloadingHandler(OffloadingHandler):
         block_size_factor: int,
         kv_cache_groups_data_refs: list[list[CanonicalKVCacheRef]],
         npu_to_cpu: bool,
-        mmap_region: SharedOffloadRegion | None = None,
     ):
         assert len(npu_tensors) == len(cpu_tensors)
         assert len(npu_tensors) > 0
@@ -103,24 +100,27 @@ class SingleDirectionNPUOffloadingHandler(OffloadingHandler):
             _, cpu_page_size = cpu_tensor.shape
             assert cpu_page_size == npu_page_size * block_size_factor
 
-        self.src_tensors = npu_tensors if npu_to_cpu else cpu_tensors
-        self.dst_tensors = cpu_tensors if npu_to_cpu else npu_tensors
+        # Keep independent lists in both directions. shutdown() of one handler
+        # must not mutate the tensor list owned by the other handler.
+        self.src_tensors = list(npu_tensors if npu_to_cpu else cpu_tensors)
+        self.dst_tensors = list(cpu_tensors if npu_to_cpu else npu_tensors)
         self.npu_to_cpu = npu_to_cpu
         self.kv_cache_groups_data_refs = kv_cache_groups_data_refs
         self.src_block_size_factor = 1 if npu_to_cpu else block_size_factor
         self.dst_block_size_factor = block_size_factor if npu_to_cpu else 1
-        self.transfer_type = ("NPU", "CPU") if npu_to_cpu else ("CPU", "NPU")
         self.direction = DIRECTION_D2H if npu_to_cpu else DIRECTION_H2D
-        self._mmap_region = mmap_region
-
         self._transfer_events: dict[int, torch.npu.Event] = {}
         self._transfers: deque[Transfer] = deque()
         self._stream_pool: list[torch.npu.Stream] = []
         self._event_pool: list[torch.npu.Event] = []
         self._buffer_pool: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
-    def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
-        src_spec, dst_spec = transfer_spec
+    def transfer_async(
+        self,
+        job_id: int,
+        src_spec: LoadStoreSpec,
+        dst_spec: LoadStoreSpec,
+    ) -> bool:
         assert isinstance(src_spec, BlockIDsLoadStoreSpec)
         assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
 
@@ -244,7 +244,6 @@ class SingleDirectionNPUOffloadingHandler(OffloadingHandler):
                     success=True,
                     transfer_size=transfer.num_bytes,
                     transfer_time=transfer_time,
-                    transfer_type=self.transfer_type,
                 )
             )
             self._stream_pool.append(transfer.stream)
@@ -270,12 +269,11 @@ class SingleDirectionNPUOffloadingHandler(OffloadingHandler):
         self._buffer_pool.clear()
         self.src_tensors.clear()
         self.dst_tensors.clear()
-        if self._mmap_region is not None:
-            self._mmap_region.cleanup()
-            self._mmap_region = None
 
 
-class CpuNpuOffloadingHandlers:
+class NPUOffloadingWorker(OffloadingWorker):
+    """vLLM offloading worker backed by Ascend batched DMA copies."""
+
     def __init__(
         self,
         kv_caches: CanonicalKVCaches,
@@ -283,6 +281,7 @@ class CpuNpuOffloadingHandlers:
         num_cpu_blocks: int,
         mmap_region: SharedOffloadRegion | None = None,
     ):
+        self._mmap_region = mmap_region
         pin_memory = is_pin_memory_available()
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
 
@@ -320,7 +319,6 @@ class CpuNpuOffloadingHandlers:
             block_size_factor=block_size_factor,
             kv_cache_groups_data_refs=kv_caches.group_data_refs,
             npu_to_cpu=True,
-            mmap_region=mmap_region,
         )
         self.cpu_to_npu_handler = SingleDirectionNPUOffloadingHandler(
             npu_tensors=npu_tensors,
@@ -329,3 +327,42 @@ class CpuNpuOffloadingHandlers:
             kv_cache_groups_data_refs=kv_caches.group_data_refs,
             npu_to_cpu=False,
         )
+
+    def submit_store(
+        self,
+        job_id: int,
+        src_spec: GPULoadStoreSpec,
+        dst_spec: LoadStoreSpec,
+    ) -> bool:
+        """Submit an asynchronous NPU-to-CPU transfer."""
+        return self.npu_to_cpu_handler.transfer_async(job_id, src_spec, dst_spec)
+
+    def submit_load(
+        self,
+        job_id: int,
+        src_spec: LoadStoreSpec,
+        dst_spec: GPULoadStoreSpec,
+    ) -> bool:
+        """Submit an asynchronous CPU-to-NPU transfer."""
+        return self.cpu_to_npu_handler.transfer_async(job_id, src_spec, dst_spec)
+
+    def get_finished(self) -> list[TransferResult]:
+        return self.npu_to_cpu_handler.get_finished() + self.cpu_to_npu_handler.get_finished()
+
+    def wait(self, job_ids: set[int]) -> None:
+        self.npu_to_cpu_handler.wait(job_ids)
+        self.cpu_to_npu_handler.wait(job_ids)
+
+    def shutdown(self) -> None:
+        try:
+            self.npu_to_cpu_handler.shutdown()
+        finally:
+            try:
+                self.cpu_to_npu_handler.shutdown()
+            finally:
+                # Both handlers reference mmap-backed CPU tensors. Release all
+                # tensor views before closing the mapping to avoid BufferError
+                # and leaked mappings during engine shutdown or restart.
+                if self._mmap_region is not None:
+                    self._mmap_region.cleanup()
+                    self._mmap_region = None

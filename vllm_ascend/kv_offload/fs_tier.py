@@ -3,7 +3,7 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 """Ascend filesystem secondary tier for multi-tier KV cache offloading.
 
-The upstream ``fs_python`` tier (``vllm.v1.kv_offload.tiering.fs``) opens every
+The upstream ``fs`` tier (``vllm.v1.kv_offload.tiering.fs``) opens every
 block file with ``O_DIRECT``. ``O_DIRECT`` imposes strict alignment
 requirements on the buffer address, the file offset and the transfer length
 (typically the filesystem logical block size, 512 B or 4 KiB). The primary-tier
@@ -155,7 +155,7 @@ def load_block(
 
 
 class AscendFileSystemTierManager(FileSystemTierManager):
-    """``fs_python`` secondary tier without the ``O_DIRECT`` requirement.
+    """``fs`` secondary tier without the ``O_DIRECT`` requirement.
 
     Accepts every upstream ``FileSystemTierManager`` argument plus one Ascend
     knob:

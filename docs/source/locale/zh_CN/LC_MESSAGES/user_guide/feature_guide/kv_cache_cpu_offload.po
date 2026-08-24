@@ -40,12 +40,12 @@ msgstr ""
 
 #: ../../source/user_guide/feature_guide/kv_cache_cpu_offload.md:7
 msgid ""
-"This feature is built on vLLM's `OffloadingConnector` framework and "
-"provides an Ascend NPU-specific implementation (`NPUOffloadingSpec`) that"
-" uses dedicated NPU streams for efficient asynchronous data transfers "
-"between NPU and CPU."
+"This feature is built on vLLM's `OffloadingConnector` framework. The "
+"upstream `CPUOffloadingSpec` and `TieringOffloadingSpec` names are registered "
+"with Ascend NPU implementations that use dedicated NPU streams for efficient "
+"asynchronous data transfers between NPU and CPU."
 msgstr ""
-"该功能基于vLLM的`OffloadingConnector`框架构建，并提供了Ascend NPU专用实现（`NPUOffloadingSpec`），使用专用NPU流在NPU和CPU之间进行高效的异步数据传输。"
+"该功能基于vLLM的`OffloadingConnector`框架构建。上游的`CPUOffloadingSpec`和`TieringOffloadingSpec`名称会注册为Ascend NPU实现，并使用专用NPU流在NPU和CPU之间进行高效的异步数据传输。"
 
 #: ../../source/user_guide/feature_guide/kv_cache_cpu_offload.md:9
 msgid "Key Concepts"
@@ -102,11 +102,10 @@ msgstr ""
 
 #: ../../source/user_guide/feature_guide/kv_cache_cpu_offload.md:68
 msgid ""
-"`num_cpu_blocks`: Number of blocks to allocate in CPU memory. Increase "
-"this value for longer context scenarios. Each block consumes memory "
-"proportional to `block_size × num_layers × (key_size + value_size)`."
+"`cpu_bytes_to_use`: Bytes to allocate for the CPU offload tier. This is "
+"required by the current vLLM offloading specs."
 msgstr ""
-"`num_cpu_blocks`：在CPU内存中分配的块数。对于更长上下文场景，请增加此值。每个块消耗的内存与`block_size × num_layers × (key_size + value_size)`成正比。"
+"`cpu_bytes_to_use`：为CPU卸载层分配的字节数。当前vLLM卸载规范要求配置此参数。"
 
 #: ../../source/user_guide/feature_guide/kv_cache_cpu_offload.md:69
 msgid ""
@@ -116,12 +115,13 @@ msgstr ""
 "`block_size`：CPU端块大小。应为NPU端块大小的倍数。典型值：`128`。"
 
 #: ../../source/user_guide/feature_guide/kv_cache_cpu_offload.md:70
-msgid "`spec_name`: Must be `\"NPUOffloadingSpec\"` for Ascend NPU."
-msgstr "`spec_name`：对于Ascend NPU，必须为`\"NPUOffloadingSpec\"`。"
-
-#: ../../source/user_guide/feature_guide/kv_cache_cpu_offload.md:71
-msgid "`spec_module_path`: Must be `\"vllm_ascend.kv_offload.npu\"`."
-msgstr "`spec_module_path`：必须为`\"vllm_ascend.kv_offload.npu\"`。"
+msgid ""
+"`spec_name`: Use the upstream names `\"CPUOffloadingSpec\"` for CPU-only "
+"offload or `\"TieringOffloadingSpec\"` for multi-tier offload. vLLM Ascend "
+"transparently maps them to the NPU implementations."
+msgstr ""
+"`spec_name`：CPU单层卸载使用上游名称`\"CPUOffloadingSpec\"`，多层卸载使用"
+"`\"TieringOffloadingSpec\"`。vLLM Ascend会将其透明映射到NPU实现。"
 
 #: ../../source/user_guide/feature_guide/kv_cache_cpu_offload.md:73
 msgid "How It Works"
@@ -179,10 +179,10 @@ msgstr "此功能需要vLLM v1引擎。"
 
 #: ../../source/user_guide/feature_guide/kv_cache_cpu_offload.md:105
 msgid ""
-"Adjust `num_cpu_blocks` based on available CPU memory. Using too many "
-"blocks may cause out-of-memory errors on the host."
+"Adjust `cpu_bytes_to_use` based on available CPU memory. Reserving too much "
+"may cause out-of-memory errors on the host."
 msgstr ""
-"根据可用CPU内存调整`num_cpu_blocks`。使用过多块可能导致主机内存不足错误。"
+"根据可用CPU内存调整`cpu_bytes_to_use`。预留过多内存可能导致主机内存不足错误。"
 
 #: ../../source/user_guide/feature_guide/kv_cache_cpu_offload.md:106
 msgid ""
@@ -202,6 +202,6 @@ msgstr ""
 #: ../../source/user_guide/feature_guide/kv_cache_cpu_offload.md:108
 msgid ""
 "For production workloads, benchmark with realistic request patterns to "
-"find the optimal `num_cpu_blocks` and `block_size` settings."
+"find the optimal `cpu_bytes_to_use` and `block_size` settings."
 msgstr ""
-"对于生产工作负载，请使用真实请求模式进行基准测试，以找到最佳的`num_cpu_blocks`和`block_size`设置。"
+"对于生产工作负载，请使用真实请求模式进行基准测试，以找到最佳的`cpu_bytes_to_use`和`block_size`设置。"

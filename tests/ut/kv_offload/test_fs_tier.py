@@ -3,7 +3,7 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 """Regression tests for the Ascend filesystem secondary tier.
 
-The upstream ``fs_python`` tier opens block files with ``O_DIRECT``, which
+The upstream ``fs`` tier opens block files with ``O_DIRECT``, which
 fails with ``EINVAL`` on filesystems / buffers that do not meet its alignment
 requirements (e.g. 3FS via FUSE). The Ascend tier performs the same per-block
 I/O with buffered flags by default; these tests exercise that buffered path.

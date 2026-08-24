@@ -14,59 +14,94 @@ signature or it crashes at worker-side handler construction time.
 import inspect
 from types import SimpleNamespace
 
+import pytest
+import torch
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
+    OffloadingConnectorWorker,
+)
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.kv_offload.base import OffloadingWorker
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 import vllm_ascend.kv_offload.npu as npu_mod
+from vllm_ascend.distributed.kv_transfer.offloading_connector import (
+    NPUOffloadingConnectorWorker,
+)
 
 
-def _build_configs(num_cpu_blocks=1000, world_size=1, block_size=128, block_factor=None):
-    extra: dict = {"num_cpu_blocks": num_cpu_blocks}
-    if block_factor is not None:
-        extra["block_size"] = block_size * block_factor
-    vllm_config = SimpleNamespace(
-        kv_transfer_config=SimpleNamespace(kv_connector_extra_config=extra),
-        parallel_config=SimpleNamespace(
-            decode_context_parallel_size=1,
-            prefill_context_parallel_size=1,
-            world_size=world_size,
-        ),
-    )
-    kv_cache_config = SimpleNamespace(
-        num_blocks=10,
-        # 2 tensors * 1280 bytes = 2560 total -> 256 bytes / gpu block
-        kv_cache_tensors=[SimpleNamespace(size=1280), SimpleNamespace(size=1280)],
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=block_size))],
-    )
-    return vllm_config, kv_cache_config, extra
+def test_npu_worker_implements_v025_worker_protocol():
+    assert issubclass(npu_mod.NPUOffloadingWorker, OffloadingWorker)
 
 
-def test_legacy_num_blocks_recovers_num_blocks():
-    """cpu_bytes_to_use must be set so CPUOffloadingSpec recovers num_blocks."""
-    vllm_config, kv_cache_config, extra = _build_configs(num_cpu_blocks=1000)
-    npu_mod._set_cpu_bytes_from_legacy_num_blocks(vllm_config, kv_cache_config)
+def test_npu_worker_routes_store_and_load_by_direction():
+    calls = []
 
-    kv_bytes_per_offloaded_block = (2560 // 10) * 1  # world_size=1, factor=1
-    assert extra["cpu_bytes_to_use"] == 1000 * kv_bytes_per_offloaded_block
-    # The upstream CPUOffloadingSpec recomputes num_blocks from this budget.
-    assert extra["cpu_bytes_to_use"] // kv_bytes_per_offloaded_block == 1000
+    class _FakeHandler:
+        def __init__(self, direction):
+            self.direction = direction
 
+        def transfer_async(self, job_id, src_spec, dst_spec):
+            calls.append((self.direction, job_id, src_spec, dst_spec))
+            return True
 
-def test_legacy_num_blocks_honors_block_size_factor():
-    vllm_config, kv_cache_config, extra = _build_configs(num_cpu_blocks=500, block_size=128, block_factor=4)
-    npu_mod._set_cpu_bytes_from_legacy_num_blocks(vllm_config, kv_cache_config)
-    kv_bytes_per_offloaded_block = (2560 // 10) * 1 * 4
-    assert extra["cpu_bytes_to_use"] == 500 * kv_bytes_per_offloaded_block
+    worker = npu_mod.NPUOffloadingWorker.__new__(npu_mod.NPUOffloadingWorker)
+    worker.npu_to_cpu_handler = _FakeHandler("store")
+    worker.cpu_to_npu_handler = _FakeHandler("load")
 
-
-def test_legacy_num_blocks_noop_when_bytes_already_set():
-    vllm_config, kv_cache_config, extra = _build_configs()
-    extra["cpu_bytes_to_use"] = 12345
-    npu_mod._set_cpu_bytes_from_legacy_num_blocks(vllm_config, kv_cache_config)
-    assert extra["cpu_bytes_to_use"] == 12345
+    assert worker.submit_store(1, "npu", "cpu")
+    assert worker.submit_load(2, "cpu", "npu")
+    assert calls == [
+        ("store", 1, "npu", "cpu"),
+        ("load", 2, "cpu", "npu"),
+    ]
 
 
-def test_tiering_create_handlers_matches_shared_region_signature(monkeypatch):
-    """create_handlers must call SharedOffloadRegion with a valid signature."""
+def test_npu_worker_releases_handlers_before_mmap():
+    calls = []
+
+    class _FakeHandler:
+        def __init__(self, name):
+            self.name = name
+
+        def shutdown(self):
+            calls.append(self.name)
+
+    class _FakeRegion:
+        def cleanup(self):
+            calls.append("mmap")
+
+    worker = npu_mod.NPUOffloadingWorker.__new__(npu_mod.NPUOffloadingWorker)
+    worker.npu_to_cpu_handler = _FakeHandler("store")
+    worker.cpu_to_npu_handler = _FakeHandler("load")
+    worker._mmap_region = _FakeRegion()
+
+    worker.shutdown()
+
+    assert calls == ["store", "load", "mmap"]
+    assert worker._mmap_region is None
+
+
+def test_npu_spec_caches_worker_without_upstream_platform_gate(monkeypatch):
+    worker = object()
+    spec = npu_mod.NPUOffloadingSpec.__new__(npu_mod.NPUOffloadingSpec)
+    spec._worker = None
+    create_calls = 0
+
+    def create_worker(kv_caches):
+        nonlocal create_calls
+        create_calls += 1
+        return worker
+
+    monkeypatch.setattr(spec, "create_worker", create_worker)
+    kv_caches = object()
+
+    assert spec.get_worker(kv_caches) is worker
+    assert spec.get_worker(kv_caches) is worker
+    assert create_calls == 1
+
+
+def test_tiering_create_worker_matches_shared_region_signature(monkeypatch):
+    """create_worker must call SharedOffloadRegion with a valid signature."""
     captured: dict = {}
 
     class _FakeRegion:
@@ -77,14 +112,14 @@ def test_tiering_create_handlers_matches_shared_region_signature(monkeypatch):
             captured.update(kwargs)
             captured["region"] = self
 
-    sentinel_handlers = object()
+    sentinel_worker = object()
 
-    def _fake_handlers(**kwargs):
-        captured["handler_kwargs"] = kwargs
-        return sentinel_handlers
+    def _fake_worker(**kwargs):
+        captured["worker_kwargs"] = kwargs
+        return sentinel_worker
 
     monkeypatch.setattr(npu_mod, "SharedOffloadRegion", _FakeRegion)
-    monkeypatch.setattr(npu_mod, "CpuNpuOffloadingHandlers", _fake_handlers)
+    monkeypatch.setattr(npu_mod, "NPUOffloadingWorker", _fake_worker)
     monkeypatch.setattr(
         npu_mod.torch,
         "npu",
@@ -104,9 +139,9 @@ def test_tiering_create_handlers_matches_shared_region_signature(monkeypatch):
     # derives its total size from num_blocks * this value.
     spec.kv_bytes_per_offloaded_block = 4096
 
-    result = spec.create_handlers(kv_caches=object())
+    result = spec.create_worker(kv_caches=object())
 
-    assert result is sentinel_handlers
+    assert result is sentinel_worker
     # New upstream signature: size is derived from num_blocks * kv_bytes_per_block.
     assert captured["kv_bytes_per_block"] == 4096
     assert captured["num_blocks"] == 10
@@ -116,5 +151,139 @@ def test_tiering_create_handlers_matches_shared_region_signature(monkeypatch):
     # The removed kwargs must never reappear.
     assert "total_size_bytes" not in captured
     assert "num_workers" not in captured
-    # The worker handlers must receive the mmap region they will clean up.
-    assert captured["handler_kwargs"]["mmap_region"] is captured["region"]
+    # The NPU worker must receive the mmap region it will clean up.
+    assert captured["worker_kwargs"]["mmap_region"] is captured["region"]
+
+
+def test_tiering_create_worker_cleans_mmap_on_construction_failure(monkeypatch):
+    cleaned = []
+
+    class _FakeRegion:
+        def __init__(self, **kwargs):
+            pass
+
+        def cleanup(self):
+            cleaned.append(True)
+
+    def _failing_worker(**kwargs):
+        raise ValueError("invalid KV layout")
+
+    monkeypatch.setattr(npu_mod, "SharedOffloadRegion", _FakeRegion)
+    monkeypatch.setattr(npu_mod, "NPUOffloadingWorker", _failing_worker)
+    monkeypatch.setattr(
+        npu_mod.torch,
+        "npu",
+        SimpleNamespace(current_device=lambda: 0),
+        raising=False,
+    )
+
+    spec = npu_mod.NPUTieringOffloadingSpec.__new__(npu_mod.NPUTieringOffloadingSpec)
+    spec.vllm_config = SimpleNamespace(instance_id="inst")
+    spec.cpu_page_size_per_worker = 64
+    spec.num_blocks = 10
+    spec.block_size_factor = 1
+    spec.kv_bytes_per_offloaded_block = 4096
+
+    with pytest.raises(ValueError, match="invalid KV layout"):
+        spec.create_worker(kv_caches=object())
+
+    assert cleaned == [True]
+
+
+def test_upstream_compatible_layout_uses_upstream_canonicalization(monkeypatch):
+    layer_name = "model.layers.0.self_attn"
+    spec = FullAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=3,
+        dtype=torch.bfloat16,
+    )
+    worker = NPUOffloadingConnectorWorker.__new__(NPUOffloadingConnectorWorker)
+    worker.spec = SimpleNamespace(
+        kv_cache_config=SimpleNamespace(
+            num_blocks=4,
+            kv_cache_groups=[SimpleNamespace(layer_names=[layer_name], kv_cache_spec=spec)],
+        )
+    )
+    calls = []
+
+    def _capture_upstream(self, kv_caches):
+        calls.append(kv_caches)
+
+    monkeypatch.setattr(
+        OffloadingConnectorWorker,
+        "register_kv_caches",
+        _capture_upstream,
+    )
+    caches = {layer_name: torch.empty((4, 2, 1, 6), dtype=torch.bfloat16)}
+
+    worker.register_kv_caches(caches)
+
+    assert calls == [caches]
+
+
+def test_split_attention_cache_is_canonicalized_without_copy():
+    layer_name = "model.layers.0.self_attn"
+    spec = FullAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=3,
+        dtype=torch.bfloat16,
+    )
+    worker = NPUOffloadingConnectorWorker.__new__(NPUOffloadingConnectorWorker)
+    worker.spec = SimpleNamespace(
+        kv_cache_config=SimpleNamespace(
+            num_blocks=4,
+            kv_cache_groups=[SimpleNamespace(layer_names=[layer_name], kv_cache_spec=spec)],
+        )
+    )
+    captured = []
+    worker._init_worker = captured.append
+    key = torch.empty((4, 2, 3), dtype=torch.bfloat16)
+    value = torch.empty((4, 2, 3), dtype=torch.bfloat16)
+
+    worker.register_kv_caches({layer_name: (key, value)})
+
+    canonical = captured[0]
+    assert [tensor.tensor.shape for tensor in canonical.tensors] == [
+        (4, 12),
+        (4, 12),
+    ]
+    assert [ref.page_size_bytes for ref in canonical.group_data_refs[0]] == [
+        12,
+        12,
+    ]
+    assert canonical.tensors[0].tensor.data_ptr() == key.data_ptr()
+    assert canonical.tensors[1].tensor.data_ptr() == value.data_ptr()
+
+
+def test_mamba_states_with_independent_storage_are_canonicalized():
+    layer_name = "model.layers.0.mixer"
+    spec = MambaSpec(
+        block_size=1,
+        shapes=((2,), (3,)),
+        dtypes=(torch.int8, torch.int8),
+        page_size_padded=8,
+    )
+    worker = NPUOffloadingConnectorWorker.__new__(NPUOffloadingConnectorWorker)
+    worker.spec = SimpleNamespace(
+        kv_cache_config=SimpleNamespace(
+            num_blocks=4,
+            kv_cache_groups=[SimpleNamespace(layer_names=[layer_name], kv_cache_spec=spec)],
+        )
+    )
+    captured = []
+    worker._init_worker = captured.append
+    first_state = torch.empty((4, 2), dtype=torch.int8)
+    second_state = torch.empty((4, 3), dtype=torch.int8)
+
+    worker.register_kv_caches({layer_name: [first_state, second_state]})
+
+    canonical = captured[0]
+    assert [tensor.tensor.shape for tensor in canonical.tensors] == [
+        (4, 2),
+        (4, 3),
+    ]
+    assert [ref.page_size_bytes for ref in canonical.group_data_refs[0]] == [2, 3]
+    assert canonical.tensors[0].tensor.data_ptr() == first_state.data_ptr()
+    assert canonical.tensors[1].tensor.data_ptr() == second_state.data_ptr()

@@ -36,10 +36,29 @@ class NPUOffloadingConnectorWorker(OffloadingConnectorWorker):
     offloading worker flow.
     """
 
-    def _as_block_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+    def _as_block_tensor(
+        self,
+        tensor: torch.Tensor,
+        page_size_bytes: int,
+    ) -> torch.Tensor:
         elem_size = tensor.element_size()
         byte_offset = tensor.storage_offset() * elem_size
         block_stride_bytes = tensor.stride(0) * elem_size
+        expected_stride = 1
+        for size, stride in zip(reversed(tensor.shape[1:]), reversed(tensor.stride()[1:])):
+            if size > 1 and stride != expected_stride:
+                raise ValueError(
+                    "Cannot offload an Ascend KV cache whose block payload "
+                    f"is non-contiguous: shape={tuple(tensor.shape)}, "
+                    f"stride={tensor.stride()}"
+                )
+            expected_stride *= size
+        if block_stride_bytes < page_size_bytes:
+            raise ValueError(
+                "Ascend KV cache blocks overlap in storage: "
+                f"stride_bytes={block_stride_bytes}, "
+                f"page_size_bytes={page_size_bytes}"
+            )
         return torch.tensor(
             [],
             dtype=torch.int8,
@@ -47,7 +66,7 @@ class NPUOffloadingConnectorWorker(OffloadingConnectorWorker):
         ).set_(
             tensor.untyped_storage(),
             byte_offset,
-            (self.spec.kv_cache_config.num_blocks, block_stride_bytes),
+            (self.spec.kv_cache_config.num_blocks, page_size_bytes),
             (block_stride_bytes, 1),
         )
 
@@ -62,7 +81,8 @@ class NPUOffloadingConnectorWorker(OffloadingConnectorWorker):
         tensor_to_idx: dict[tuple[int, int, int, torch.device], int],
         ref_page_size_bytes: int | None = None,
     ) -> CanonicalKVCacheRef:
-        block_tensor = self._as_block_tensor(tensor)
+        tensor_page_size_bytes = self._tensor_page_size_bytes(tensor)
+        block_tensor = self._as_block_tensor(tensor, tensor_page_size_bytes)
         key = (
             tensor.untyped_storage().data_ptr(),
             tensor.storage_offset() * tensor.element_size(),
@@ -76,7 +96,7 @@ class NPUOffloadingConnectorWorker(OffloadingConnectorWorker):
             block_tensors.append(
                 CanonicalKVCacheTensor(
                     tensor=block_tensor,
-                    page_size_bytes=block_tensor.stride(0),
+                    page_size_bytes=tensor_page_size_bytes,
                 )
             )
 
@@ -88,6 +108,29 @@ class NPUOffloadingConnectorWorker(OffloadingConnectorWorker):
         )
 
     def register_kv_caches(self, kv_caches: dict[str, KVCacheValue]):
+        # Preserve upstream v0.25 canonicalization (including packed-layout
+        # handling and stride fixes) whenever the cache layout is already
+        # upstream-compatible. Ascend-specific handling is only needed for
+        # split attention tensors and separately allocated Mamba states.
+        requires_layout_adaptation = False
+        for kv_cache_group in self.spec.kv_cache_config.kv_cache_groups:
+            group_spec = kv_cache_group.kv_cache_spec
+            per_layer_specs = group_spec.kv_cache_specs if isinstance(group_spec, UniformTypeKVCacheSpecs) else {}
+            for layer_name in kv_cache_group.layer_names:
+                layer_spec = per_layer_specs.get(layer_name, group_spec)
+                layer_cache = kv_caches[layer_name]
+                if (isinstance(layer_spec, AttentionSpec) and not isinstance(layer_cache, torch.Tensor)) or isinstance(
+                    layer_spec, MambaSpec
+                ):
+                    requires_layout_adaptation = True
+                    break
+            if requires_layout_adaptation:
+                break
+
+        if not requires_layout_adaptation:
+            super().register_kv_caches(kv_caches)  # type: ignore[arg-type]
+            return
+
         block_tensors: list[CanonicalKVCacheTensor] = []
         block_data_refs: dict[str, list[CanonicalKVCacheRef]] = defaultdict(list)
         tensor_to_idx: dict[tuple[int, int, int, torch.device], int] = {}
@@ -113,6 +156,14 @@ class NPUOffloadingConnectorWorker(OffloadingConnectorWorker):
                             )
                         )
                     else:
+                        component_bytes = sum(self._tensor_page_size_bytes(tensor) for tensor in layer_kv_cache)
+                        if component_bytes != layer_kv_cache_spec.real_page_size_bytes:
+                            raise ValueError(
+                                "Ascend attention KV cache components do not "
+                                f"cover one logical page for {layer_name}: "
+                                f"components={component_bytes}, "
+                                f"spec={layer_kv_cache_spec.real_page_size_bytes}"
+                            )
                         for tensor in layer_kv_cache:
                             block_data_refs[layer_name].append(
                                 self._add_tensor_ref(
@@ -125,35 +176,25 @@ class NPUOffloadingConnectorWorker(OffloadingConnectorWorker):
                 elif isinstance(layer_kv_cache_spec, MambaSpec):
                     assert isinstance(layer_kv_cache, list)
                     assert len(layer_kv_cache) > 0
-                    first_state_tensor = layer_kv_cache[0]
-                    assert first_state_tensor.storage_offset() == 0
-                    tensor = (
-                        torch.tensor(
-                            [],
-                            dtype=torch.int8,
-                            device=first_state_tensor.device,
+                    state_bytes = sum(self._tensor_page_size_bytes(tensor) for tensor in layer_kv_cache)
+                    expected_bytes = replace(layer_kv_cache_spec, page_size_padded=None).page_size_bytes
+                    if state_bytes != expected_bytes:
+                        raise ValueError(
+                            f"Mamba KV cache page size mismatch for {layer_name}: "
+                            f"tensors={state_bytes}, spec={expected_bytes}"
                         )
-                        .set_(first_state_tensor.untyped_storage())
-                        .view(
-                            (
-                                self.spec.kv_cache_config.num_blocks,
-                                layer_kv_cache_spec.page_size_bytes,
+                    # Ascend state tensors may be separately allocated or have
+                    # aligned, non-zero storage offsets. Register each state
+                    # independently instead of reconstructing a single tensor
+                    # from the first state's entire storage.
+                    for tensor in layer_kv_cache:
+                        block_data_refs[layer_name].append(
+                            self._add_tensor_ref(
+                                tensor,
+                                block_tensors,
+                                tensor_to_idx,
                             )
                         )
-                    )
-                    tensor_idx = len(block_tensors)
-                    block_tensors.append(
-                        CanonicalKVCacheTensor(
-                            tensor=tensor,
-                            page_size_bytes=layer_kv_cache_spec.page_size_bytes,
-                        )
-                    )
-                    block_data_refs[layer_name].append(
-                        CanonicalKVCacheRef(
-                            tensor_idx=tensor_idx,
-                            page_size_bytes=replace(layer_kv_cache_spec, page_size_padded=None).page_size_bytes,
-                        )
-                    )
                 else:
                     raise NotImplementedError
 
@@ -164,7 +205,7 @@ class NPUOffloadingConnectorWorker(OffloadingConnectorWorker):
                 group_refs += block_data_refs[layer_name]
             group_data_refs.append(group_refs)
 
-        self._register_handlers(
+        self._init_worker(
             CanonicalKVCaches(
                 tensors=block_tensors,
                 group_data_refs=group_data_refs,
