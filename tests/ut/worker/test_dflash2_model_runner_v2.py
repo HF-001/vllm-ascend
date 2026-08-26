@@ -5,7 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
+from vllm_ascend.worker.v2.aclgraph_utils import ModelWithContext
 from vllm_ascend.worker.v2.spec_decode import init_speculator
 
 
@@ -31,6 +33,28 @@ def test_dflash2_composes_upstream_and_ascend_speculators():
 
     assert issubclass(dflash2.AscendDFlash2Speculator, dflash2.DFlash2Speculator)
     assert issubclass(dflash2.AscendDFlash2Speculator, dflash2.AscendDFlashSpeculator)
+
+
+def test_model_with_context_exposes_dflash2_candidate_interfaces():
+    class DraftModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.candidate_selector = nn.Identity()
+
+        def compute_candidates(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return hidden_states.to(torch.int64), hidden_states.float()
+
+    draft_model = DraftModel()
+    wrapped_model = ModelWithContext(draft_model, is_draft_model=True)
+    hidden_states = torch.tensor([[1.0, 2.0]])
+
+    candidate_ids, unary_logits = wrapped_model.compute_candidates(hidden_states)
+
+    torch.testing.assert_close(candidate_ids, hidden_states.to(torch.int64))
+    torch.testing.assert_close(unary_logits, hidden_states)
+    assert wrapped_model.model is draft_model.model
+    assert wrapped_model.model.candidate_selector is draft_model.model.candidate_selector
 
 
 @pytest.mark.parametrize(

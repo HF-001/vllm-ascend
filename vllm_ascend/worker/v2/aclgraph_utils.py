@@ -235,6 +235,20 @@ class ModelWithContext(nn.Module):
     def compute_draft_logits(self, hidden_states: torch.Tensor):
         return self.original_model.compute_draft_logits(hidden_states)
 
+    def compute_candidates(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # DFlash2 computes the target-head top-k after the draft forward. Keep
+        # that model-specific entry point available while capture temporarily
+        # wraps the draft model to inject the Ascend forward context.
+        return self.original_model.compute_candidates(hidden_states)
+
+    @property
+    def model(self) -> nn.Module:
+        # DFlash2 accesses the inner candidate selector through
+        # ``self.model.model.candidate_selector`` after ``compute_candidates``.
+        # Explicit delegation is safer than a catch-all ``__getattr__`` on an
+        # nn.Module, whose own attribute lookup manages parameters and children.
+        return self.original_model.model
+
     def markov_embed(self, token_ids: torch.Tensor):
         return self.original_model.markov_embed(token_ids)
 
