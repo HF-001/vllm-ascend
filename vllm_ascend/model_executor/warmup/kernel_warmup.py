@@ -45,6 +45,11 @@ def kernel_warmup(worker: NPUWorker) -> None:
     start = time.perf_counter()
 
     _run_warmup("rejection_sampler", rejection_sampler_triton_warmup, worker)
+    if worker.use_v2_model_runner:
+        # Import only for MRV2; its rejection kernels differ from MRV1's.
+        from vllm_ascend.model_executor.warmup.spec_decode_sampler_warmup import spec_decode_sampler_warmup
+
+        _run_warmup("spec_decode_sampler", spec_decode_sampler_warmup, worker)
     _run_warmup("penalties", penalties_triton_warmup, worker)
     _run_warmup("rms", triton_rms_warmup, worker)
     _run_warmup("indexer", indexer_triton_warmup, worker)

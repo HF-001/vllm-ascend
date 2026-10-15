@@ -3,11 +3,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import gc
+from types import SimpleNamespace
 
 import pytest
 import torch
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 
+from vllm_ascend.model_executor.warmup.spec_decode_sampler_warmup import spec_decode_sampler_warmup
 from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import rejection_sample
 
 VOCAB_SIZE = 4096
@@ -68,6 +70,59 @@ def _build_rejection_sample_inputs(
         temperature=temp_tensor,
         seed=seed,
     )
+
+
+@pytest.mark.parametrize("head_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+@pytest.mark.parametrize("has_draft_logits", [False, True])
+@torch.inference_mode()
+def test_sampler_warmup_preserves_npu_sampling(head_dtype, temperature, has_draft_logits):
+    """Real warmup launches must leave subsequent sampling and device RNG unchanged."""
+    device = torch.device("npu")
+    num_steps = 3
+    num_reqs = 2
+    # Cross both the stats (8192) and resample (1024) vocabulary block boundaries.
+    vocab_size = 8193
+    target = torch.arange(vocab_size, dtype=torch.float32, device=device) / vocab_size
+    inputs = _build_rejection_sample_inputs(target, -target, num_steps, temperature, num_reqs)
+    target_dtype = head_dtype if temperature == 0.0 else torch.float32
+    inputs["target_logits"] = inputs["target_logits"].to(target_dtype)
+    inputs["draft_logits"] = inputs["draft_logits"].to(head_dtype) if has_draft_logits else None
+    # Match the serving signatures, rather than the distribution helper's defaults.
+    inputs["draft_sampled"] = inputs["draft_sampled"].to(torch.int32)
+    for name in ("pos", "idx_mapping", "expanded_idx_mapping"):
+        inputs[name] = inputs[name].to(torch.int64)
+    cached = inputs["draft_logits"]
+    cache_before = cached.clone() if cached is not None else None
+    worker = SimpleNamespace(
+        use_v2_model_runner=True,
+        vllm_config=SimpleNamespace(kernel_config=SimpleNamespace(enable_jit_warmup=True)),
+        model_config=SimpleNamespace(head_dtype=head_dtype),
+        device=device,
+        model_runner=SimpleNamespace(
+            is_last_pp_rank=True,
+            num_speculative_steps=num_steps,
+            max_num_reqs=num_reqs,
+            vocab_size=vocab_size,
+            speculator=SimpleNamespace(draft_logits=cached),
+            rejection_sampler=SimpleNamespace(synthetic_conditional_rates=None),
+        ),
+    )
+    expected, expected_count = rejection_sample(**inputs, num_speculative_steps=num_steps)
+    cpu_rng = torch.get_rng_state().clone()
+    npu_rng = torch.npu.get_rng_state().clone()
+
+    spec_decode_sampler_warmup(worker)
+
+    assert torch.equal(torch.get_rng_state(), cpu_rng)
+    assert torch.equal(torch.npu.get_rng_state(), npu_rng)
+    if cached is not None:
+        torch.testing.assert_close(cached, cache_before, rtol=0, atol=0)
+    actual, actual_count = rejection_sample(**inputs, num_speculative_steps=num_steps)
+    torch.testing.assert_close(actual_count, expected_count, rtol=0, atol=0)
+    # The kernel leaves slots after the first rejected/bonus token uninitialized.
+    valid = torch.arange(num_steps + 1, device=device)[None, :] < expected_count[:, None]
+    torch.testing.assert_close(actual[valid], expected[valid], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
